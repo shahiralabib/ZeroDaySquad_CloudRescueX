@@ -71,6 +71,12 @@ class GeminiAuthenticationError(AIProviderError):
     code = "GEMINI_AUTHENTICATION_FAILED"
 
 
+class GeminiConfigurationError(AIProviderError):
+    """The Gemini SDK client could not be built from the configured settings (for example an SDK incompatibility)."""
+
+    code = "GEMINI_CLIENT_ERROR"
+
+
 class InvalidAIResponseError(AIProviderError):
     code = "INVALID_AI_RESPONSE"
 
@@ -376,13 +382,27 @@ class GeminiProvider(AIProvider):
             from google.genai import types
         except ImportError as exc:
             raise AIProviderError("The google-genai package is not installed.") from exc
-        return genai.Client(
-            api_key=self.settings.gemini_api_key,
-            http_options=types.HttpOptions(
-                timeout=int(self.settings.gemini_timeout_seconds * 1000),
-                max_retries=self.settings.gemini_max_retries,
-            ),
-        )
+        except Exception as exc:
+            raise self._configuration_error(exc) from exc
+        try:
+            return genai.Client(
+                api_key=self.settings.gemini_api_key,
+                http_options=types.HttpOptions(
+                    timeout=int(self.settings.gemini_timeout_seconds * 1000),
+                    # The retry loop in investigate() is the only retry layer, so the SDK makes a single attempt.
+                    # (HttpOptions has no max_retries field; SDK-level retries are configured with retry_options.)
+                    retry_options=types.HttpRetryOptions(attempts=1),
+                ),
+            )
+        except Exception as exc:
+            raise self._configuration_error(exc) from exc
+
+    def _configuration_error(self, exc: Exception) -> GeminiConfigurationError:
+        # Only the exception class name is logged, and it is part of the message text because the JSON log formatter
+        # does not serialise `extra` fields. The exception message, traceback and arguments are never logged: SDK
+        # validation errors can echo their input, which includes the API key. The user-facing message is fixed.
+        logger.error("Gemini client configuration failed: %s", type(exc).__name__)
+        return GeminiConfigurationError("The Gemini client could not be configured.")
 
     def _prompt(self, evidence: InvestigationInput) -> str:
         serialized = json.dumps(evidence.model_dump(mode="json"), sort_keys=True)

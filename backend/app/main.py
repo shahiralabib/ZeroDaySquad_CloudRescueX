@@ -749,7 +749,16 @@ async def investigate_incident(incident_id: int, session: AsyncSession = Depends
     await session.commit()
     evidence = await build_investigation_input(session, incident, service)
     try:
-        result = await provider.investigate(evidence)
+        try:
+            result = await provider.investigate(evidence)
+        except AIProviderError:
+            raise
+        except Exception as exc:
+            # A provider reports failures as AIProviderError. Anything else is converted so the record below is
+            # always finished (failed) instead of staying "running"; the message is fixed so internals do not leak.
+            # Only the provider name and the exception class name are logged (never its message or traceback).
+            logger.error("AI provider %s raised an unexpected error: %s", provider.name, type(exc).__name__)
+            raise AIProviderError("The AI provider failed unexpectedly.") from exc
         status_value = "completed"
         if result.confidence_estimate < settings.ai_confidence_threshold:
             status_value = "low_confidence"
