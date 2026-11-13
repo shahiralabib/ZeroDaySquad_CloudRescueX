@@ -1,9 +1,14 @@
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import Field
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy.engine import make_url
+
+# Bearer-token lifetime in minutes. The single source of truth for the settings validation below and for app/auth.py.
+AUTH_TOKEN_TTL_DEFAULT_MINUTES = 60
+AUTH_TOKEN_TTL_MIN_MINUTES = 5
+AUTH_TOKEN_TTL_MAX_MINUTES = 720
 
 
 class Settings(BaseSettings):
@@ -17,6 +22,13 @@ class Settings(BaseSettings):
     monitoring_enabled: bool = True
     monitoring_default_interval_seconds: int = 30
     demo_admin_token: str = "local-demo-admin"
+    # Authentication (see app/auth.py). Both values are secrets. They are validated when first used rather than here, so
+    # a missing or invalid value makes protected routes answer 503 instead of stopping the application at import.
+    auth_secret: SecretStr = SecretStr("")
+    auth_users_json: SecretStr = SecretStr("")
+    auth_token_ttl_minutes: int = Field(
+        default=AUTH_TOKEN_TTL_DEFAULT_MINUTES, ge=AUTH_TOKEN_TTL_MIN_MINUTES, le=AUTH_TOKEN_TTL_MAX_MINUTES
+    )
     ai_provider: str = "local"
     gemini_api_key: str = ""
     gemini_model: str = ""
