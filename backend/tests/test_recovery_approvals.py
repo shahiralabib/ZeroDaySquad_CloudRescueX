@@ -9,9 +9,8 @@ from sqlalchemy import select, update
 from app.database import RecoveryApproval, session_factory
 from app.main import _request_windows, app
 from app.recovery import parameters_hash
+from auth_support import ANONYMOUS_HEADERS
 
-
-ADMIN = {"X-Demo-Admin-Token": "local-demo-admin"}
 
 
 @pytest.fixture(autouse=True)
@@ -33,18 +32,16 @@ async def setup_incident(client: AsyncClient) -> dict:
     ).json()
     await client.post(
         f"/api/v1/demo/services/{service['id']}/fault",
-        headers=ADMIN,
         json={"scenario": "service_unavailable"},
     )
     await client.post(f"/api/v1/services/{service['id']}/health")
-    incidents = (await client.get("/api/v1/incidents", headers=ADMIN)).json()
+    incidents = (await client.get("/api/v1/incidents")).json()
     return next(item for item in incidents if item["service_id"] == service["id"])
 
 
 async def approve(client: AsyncClient, incident_id: int, action_id: str, parameters: dict | None = None):
     return await client.post(
         f"/api/v1/incidents/{incident_id}/recovery/approve",
-        headers=ADMIN,
         json={"action_id": action_id, "parameters": parameters or {}},
     )
 
@@ -55,13 +52,11 @@ async def test_forged_boolean_is_rejected_and_exact_approval_allows_execution():
         incident = await setup_incident(client)
         rejected = await client.post(
             f"/api/v1/incidents/{incident['id']}/recovery",
-            headers=ADMIN,
             json={"action_id": "reset_demo_environment", "approved": True},
         )
         approval = await approve(client, incident["id"], "reset_demo_environment")
         executed = await client.post(
             f"/api/v1/incidents/{incident['id']}/recovery",
-            headers=ADMIN,
             json={"action_id": "reset_demo_environment", "approved": False},
         )
     assert rejected.status_code == 409
@@ -78,12 +73,10 @@ async def test_approval_cannot_cross_action_or_incident():
         assert (await approve(client, first["id"], "reset_demo_environment")).status_code == 200
         different_action = await client.post(
             f"/api/v1/incidents/{first['id']}/recovery",
-            headers=ADMIN,
             json={"action_id": "restore_known_good_configuration", "approved": True},
         )
         different_incident = await client.post(
             f"/api/v1/incidents/{second['id']}/recovery",
-            headers=ADMIN,
             json={"action_id": "reset_demo_environment", "approved": True},
         )
     assert different_action.json()["detail"]["code"] == "APPROVAL_REQUIRED"
@@ -104,7 +97,6 @@ async def test_different_parameters_invalidate_approval_match():
             await session.commit()
         rejected = await client.post(
             f"/api/v1/incidents/{incident['id']}/recovery",
-            headers=ADMIN,
             json={"action_id": "scale_demo_application", "parameters": {"instances": 1}, "approved": True},
         )
     assert approval.status_code == 200
@@ -127,7 +119,6 @@ async def test_expired_and_revoked_approvals_are_rejected():
             await session.commit()
         expired = await client.post(
             f"/api/v1/incidents/{incident['id']}/recovery",
-            headers=ADMIN,
             json={"action_id": "reset_demo_environment"},
         )
         incident = await setup_incident(client)
@@ -142,7 +133,6 @@ async def test_expired_and_revoked_approvals_are_rejected():
             await session.commit()
         revoked = await client.post(
             f"/api/v1/incidents/{incident['id']}/recovery",
-            headers=ADMIN,
             json={"action_id": "reset_demo_environment"},
         )
     assert expired.json()["detail"]["code"] == "APPROVAL_REQUIRED"
@@ -156,7 +146,6 @@ async def test_consumed_approval_cannot_be_reused_or_retry_authorized():
         assert (await approve(client, incident["id"], "reset_demo_environment")).status_code == 200
         executed = await client.post(
             f"/api/v1/incidents/{incident['id']}/recovery",
-            headers=ADMIN,
             json={"action_id": "reset_demo_environment"},
         )
         async with session_factory() as session:
@@ -168,7 +157,6 @@ async def test_consumed_approval_cannot_be_reused_or_retry_authorized():
             consumed_at = approval.consumed_at
         reused = await client.post(
             f"/api/v1/incidents/{incident['id']}/recovery/retry",
-            headers=ADMIN,
             json={"action_id": "reset_demo_environment"},
         )
     assert executed.status_code == 201
@@ -182,7 +170,6 @@ async def test_retry_without_approval_is_rejected():
         incident = await setup_incident(client)
         response = await client.post(
             f"/api/v1/incidents/{incident['id']}/recovery/retry",
-            headers=ADMIN,
             json={"action_id": "reset_demo_environment"},
         )
     assert response.status_code == 409
@@ -194,10 +181,12 @@ async def test_unauthenticated_approval_and_execution_are_rejected():
     async with AsyncClient(transport=ASGITransport(app), base_url="http://test") as client:
         approval = await client.post(
             "/api/v1/incidents/1/recovery/approve",
+            headers=ANONYMOUS_HEADERS,  # explicitly anonymous: the default test client is authenticated
             json={"action_id": "reset_demo_environment"},
         )
         execution = await client.post(
             "/api/v1/incidents/1/recovery",
+            headers=ANONYMOUS_HEADERS,
             json={"action_id": "reset_demo_environment", "approved": True},
         )
     assert approval.status_code == 401
@@ -213,7 +202,6 @@ async def test_concurrent_requests_consume_one_approval():
         async def execute():
             return await client.post(
                 f"/api/v1/incidents/{incident['id']}/recovery",
-                headers=ADMIN,
                 json={"action_id": "scale_demo_application", "parameters": {"instances": 1}, "approved": True},
             )
 
@@ -227,7 +215,6 @@ async def test_low_risk_recovery_does_not_require_approval():
         incident = await setup_incident(client)
         response = await client.post(
             f"/api/v1/incidents/{incident['id']}/recovery",
-            headers=ADMIN,
             json={"action_id": "restart_demo_application", "approved": False},
         )
     assert response.status_code == 201

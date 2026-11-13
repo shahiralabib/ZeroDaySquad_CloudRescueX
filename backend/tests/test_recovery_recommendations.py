@@ -23,7 +23,6 @@ from app.remediation import (
     recommend_telemetry_action,
 )
 
-ADMIN = {"X-Demo-Admin-Token": "local-demo-admin"}
 RESTORE_CONFIG = "restore_known_good_configuration"
 RESTORE_DEPENDENCY = "restore_demo_dependency"
 RESTART = "restart_demo_application"
@@ -42,10 +41,10 @@ def new_client() -> AsyncClient:
 
 
 async def run_scenario(client: AsyncClient, scenario: str) -> list[dict]:
-    assert (await client.post("/api/v1/simulation/reset", headers=ADMIN)).status_code == 200
+    assert (await client.post("/api/v1/simulation/reset")).status_code == 200
     before = {item["id"] for item in (await client.get("/api/v1/incidents")).json()}
     started = await client.post(
-        "/api/v1/simulation/start", headers=ADMIN, json={"scenario": scenario, "seed": 42, "event_count": 10}
+        "/api/v1/simulation/start", json={"scenario": scenario, "seed": 42, "event_count": 10}
     )
     assert started.status_code == 200
     return [item for item in (await client.get("/api/v1/incidents")).json() if item["id"] not in before]
@@ -79,18 +78,16 @@ async def run_action(client: AsyncClient, incident_id: int, action_id: str):
     if ACTION_CATALOG[action_id].risk == "low" and (await get_incident(client, incident_id))["state"] == "ESCALATED":
         return await client.post(
             f"/api/v1/incidents/{incident_id}/recovery/retry",
-            headers=ADMIN,
             json={"action_id": action_id, "parameters": parameters, "approved": True},
         )
     if ACTION_CATALOG[action_id].risk != "low":
         approval = await client.post(
             f"/api/v1/incidents/{incident_id}/recovery/approve",
-            headers=ADMIN,
             json={"action_id": action_id, "parameters": parameters},
         )
         assert approval.status_code == 200
     return await client.post(
-        f"/api/v1/incidents/{incident_id}/recovery", headers=ADMIN, json={"action_id": action_id, "parameters": parameters}
+        f"/api/v1/incidents/{incident_id}/recovery", json={"action_id": action_id, "parameters": parameters}
     )
 
 
@@ -163,15 +160,15 @@ async def test_outage_incidents_get_the_action_for_their_injected_fault(fault, e
                 json={"name": f"Recommend {uuid4()}", "environment": "demo", "simulation_status": True, "failure_threshold": 1},
             )
         ).json()
-        await client.post(f"/api/v1/demo/services/{service['id']}/fault", headers=ADMIN, json={"scenario": fault})
+        await client.post(f"/api/v1/demo/services/{service['id']}/fault", json={"scenario": fault})
         incident = next(i for i in (await client.get("/api/v1/incidents")).json() if i["service_id"] == service["id"])
         investigation = await investigate(client, incident["id"])
         executed = await client.post(
-            f"/api/v1/incidents/{incident['id']}/recovery/approve", headers=ADMIN, json={"action_id": expected}
+            f"/api/v1/incidents/{incident['id']}/recovery/approve", json={"action_id": expected}
         )
         outcome = await run_action(client, incident["id"], expected) if executed.status_code == 409 else None
         if executed.status_code == 200:
-            outcome = await client.post(f"/api/v1/incidents/{incident['id']}/recovery", headers=ADMIN, json={"action_id": expected})
+            outcome = await client.post(f"/api/v1/incidents/{incident['id']}/recovery", json={"action_id": expected})
         verification = await latest_verification(client, incident["id"])
 
     assert investigation["result"]["recommended_action"] == expected

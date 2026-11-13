@@ -21,7 +21,6 @@ async def test_local_investigation_is_persisted_and_labeled():
         ).json()
         await client.post(
             f"/api/v1/demo/services/{service['id']}/fault",
-            headers={"X-Demo-Admin-Token": "local-demo-admin"},
             json={"scenario": "dependency_unavailable"},
         )
         await client.post(f"/api/v1/services/{service['id']}/health")

@@ -5,7 +5,9 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "prebuild": "node scripts/check-env.mjs",
     "build": "tsc -b && vite build",
+    "test": "node --test tests/auth.test.mjs",
     "preview": "vite preview"
   },
   "dependencies": {

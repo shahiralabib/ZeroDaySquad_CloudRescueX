@@ -10,8 +10,6 @@ from app.database import Incident, TelemetryEvent, session_factory
 from app.main import _request_windows, app
 from app.simulation import RESOURCE_SERVICE_NAMES, detect_telemetry
 
-ADMIN = {"X-Demo-Admin-Token": "local-demo-admin"}
-
 
 @pytest.fixture(autouse=True)
 def clear_rate_limit_window():
@@ -28,11 +26,10 @@ async def incidents_by_id(client: AsyncClient) -> dict[int, dict]:
 
 async def run_scenario(client: AsyncClient, scenario: str, seed: int = 42, event_count: int = 10) -> dict[int, dict]:
     """Reset, start a run, and return only the incidents that run created."""
-    assert (await client.post("/api/v1/simulation/reset", headers=ADMIN)).status_code == 200
+    assert (await client.post("/api/v1/simulation/reset")).status_code == 200
     before = await incidents_by_id(client)
     started = await client.post(
         "/api/v1/simulation/start",
-        headers=ADMIN,
         json={"scenario": scenario, "seed": seed, "event_count": event_count},
     )
     assert started.status_code == 200
@@ -124,7 +121,7 @@ async def test_fault_injection_detects_the_failure_immediately(threshold):
     async with new_client() as client:
         service = await create_demo_service(client, threshold=threshold)
         injected = await client.post(
-            f"/api/v1/demo/services/{service['id']}/fault", headers=ADMIN, json={"scenario": "service_unavailable"}
+            f"/api/v1/demo/services/{service['id']}/fault", json={"scenario": "service_unavailable"}
         )
         # No separate health-check call: detection must already have happened.
         incidents = [item for item in (await client.get("/api/v1/incidents")).json() if item["service_id"] == service["id"]]
@@ -144,7 +141,7 @@ async def test_injecting_healthy_does_not_run_health_checks():
     async with new_client() as client:
         service = await create_demo_service(client)
         response = await client.post(
-            f"/api/v1/demo/services/{service['id']}/fault", headers=ADMIN, json={"scenario": "healthy"}
+            f"/api/v1/demo/services/{service['id']}/fault", json={"scenario": "healthy"}
         )
         incidents = [item for item in (await client.get("/api/v1/incidents")).json() if item["service_id"] == service["id"]]
 
@@ -172,11 +169,11 @@ async def test_telemetry_incident_neither_blocks_outage_detection_nor_is_auto_re
             await session.commit()
             telemetry_id = telemetry_incident.id
 
-        await client.post(f"/api/v1/demo/services/{service['id']}/fault", headers=ADMIN, json={"scenario": "service_unavailable"})
+        await client.post(f"/api/v1/demo/services/{service['id']}/fault", json={"scenario": "service_unavailable"})
         on_service = [item for item in (await client.get("/api/v1/incidents")).json() if item["service_id"] == service["id"]]
         outage = next(item for item in on_service if item["detection_rule"] == "health_check_failure")
 
-        await client.post(f"/api/v1/demo/services/{service['id']}/reset", headers=ADMIN)
+        await client.post(f"/api/v1/demo/services/{service['id']}/reset")
         recovered = await client.post(f"/api/v1/services/{service['id']}/health")
         outage_after = (await client.get(f"/api/v1/incidents/{outage['id']}")).json()
         telemetry_after = (await client.get(f"/api/v1/incidents/{telemetry_id}")).json()

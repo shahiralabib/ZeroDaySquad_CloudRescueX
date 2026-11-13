@@ -4,6 +4,7 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from app.main import app
+from auth_support import ANONYMOUS_HEADERS
 
 
 @pytest.fixture
@@ -46,7 +47,6 @@ async def test_failure_threshold_creates_one_incident_and_recovery_resolves_it(c
         service = await create_service(client, threshold=2)
         fault = await client.post(
             f"/api/v1/demo/services/{service['id']}/fault",
-            headers={"X-Demo-Admin-Token": "local-demo-admin"},
             json={"scenario": "service_unavailable"},
         )
         assert fault.status_code == 200
@@ -57,7 +57,6 @@ async def test_failure_threshold_creates_one_incident_and_recovery_resolves_it(c
         matching = [incident for incident in incidents.json() if incident["service_id"] == service["id"]]
         reset = await client.post(
             f"/api/v1/demo/services/{service['id']}/reset",
-            headers={"X-Demo-Admin-Token": "local-demo-admin"},
         )
         recovered = await client.post(f"/api/v1/services/{service['id']}/health")
         timeline = await client.get(f"/api/v1/incidents/{matching[0]['id']}/timeline")
@@ -78,7 +77,6 @@ async def test_incident_state_transitions_reject_arbitrary_changes(client: Async
         service = await create_service(client, threshold=1)
         await client.post(
             f"/api/v1/demo/services/{service['id']}/fault",
-            headers={"X-Demo-Admin-Token": "local-demo-admin"},
             json={"scenario": "configuration_failure"},
         )
         await client.post(f"/api/v1/services/{service['id']}/health")
@@ -102,12 +100,12 @@ async def test_demo_fault_operations_require_authorization_and_isolate_non_demo_
         demo_service = await create_service(client)
         unauthorized = await client.post(
             f"/api/v1/demo/services/{demo_service['id']}/fault",
+            headers=ANONYMOUS_HEADERS,  # explicitly anonymous: the default test client is authenticated
             json={"scenario": "dependency_unavailable"},
         )
         production_service = await create_service(client, simulation_status=False)
         forbidden = await client.post(
             f"/api/v1/demo/services/{production_service['id']}/fault",
-            headers={"X-Demo-Admin-Token": "local-demo-admin"},
             json={"scenario": "dependency_unavailable"},
         )
         scenarios = await client.get("/api/v1/demo/scenarios")

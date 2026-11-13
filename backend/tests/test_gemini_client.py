@@ -29,7 +29,6 @@ from app.config import Settings
 from app.logging import JsonFormatter
 from app.main import _request_windows, app
 
-ADMIN = {"X-Demo-Admin-Token": "local-demo-admin"}
 FAKE_KEY = "fake-key-not-a-real-credential"
 
 
@@ -278,7 +277,7 @@ async def new_incident(client: AsyncClient) -> dict:
             json={"name": f"B1 provider failure {uuid4()}", "environment": "demo", "simulation_status": True, "failure_threshold": 1},
         )
     ).json()
-    await client.post(f"/api/v1/demo/services/{service['id']}/fault", headers=ADMIN, json={"scenario": "service_unavailable"})
+    await client.post(f"/api/v1/demo/services/{service['id']}/fault", json={"scenario": "service_unavailable"})
     return next(item for item in (await client.get("/api/v1/incidents")).json() if item["service_id"] == service["id"])
 
 

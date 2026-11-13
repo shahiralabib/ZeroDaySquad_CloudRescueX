@@ -13,7 +13,6 @@ from app.main import _request_windows, app
 from app.simulation import DEMO_BRUTE_FORCE_SOURCE, DEMO_UNUSUAL_TRAFFIC_SOURCE
 from sqlalchemy import select
 
-ADMIN = {"X-Demo-Admin-Token": "local-demo-admin"}
 ALL_ACTIONS = [
     "restart_demo_application",
     "restore_known_good_configuration",
@@ -33,10 +32,10 @@ def new_client() -> AsyncClient:
 
 
 async def run_scenario(client: AsyncClient, scenario: str) -> list[dict]:
-    assert (await client.post("/api/v1/simulation/reset", headers=ADMIN)).status_code == 200
+    assert (await client.post("/api/v1/simulation/reset")).status_code == 200
     before = {item["id"] for item in (await client.get("/api/v1/incidents")).json()}
     started = await client.post(
-        "/api/v1/simulation/start", headers=ADMIN, json={"scenario": scenario, "seed": 42, "event_count": 10}
+        "/api/v1/simulation/start", json={"scenario": scenario, "seed": 42, "event_count": 10}
     )
     assert started.status_code == 200
     return [item for item in (await client.get("/api/v1/incidents")).json() if item["id"] not in before]
@@ -201,7 +200,7 @@ async def test_health_check_incident_investigation_is_unchanged():
             )
         ).json()
         await client.post(
-            f"/api/v1/demo/services/{service['id']}/fault", headers=ADMIN, json={"scenario": "dependency_unavailable"}
+            f"/api/v1/demo/services/{service['id']}/fault", json={"scenario": "dependency_unavailable"}
         )
         incident = next(
             item for item in (await client.get("/api/v1/incidents")).json() if item["service_id"] == service["id"]

@@ -8,6 +8,10 @@ services:
       FRONTEND_ORIGINS: http://localhost:5173,http://127.0.0.1:5173
       SEED_DEMO_DATA: "true"
       PORT: 8000
+      # Taken from the shell or the project .env file; empty means authentication is not configured (login answers 503).
+      AUTH_SECRET: ${AUTH_SECRET:-}
+      AUTH_USERS_JSON: ${AUTH_USERS_JSON:-}
+      AUTH_TOKEN_TTL_MINUTES: ${AUTH_TOKEN_TTL_MINUTES:-60}
     volumes:
       - ./backend:/app
   frontend:

@@ -2,6 +2,8 @@
 
 ## Local Windows PowerShell
 
+Set up authentication first (see the [README](../README.md#authentication-and-roles)); without it the dashboard shows the sign-in page but nobody can sign in.
+
 ```powershell
 # Run from the project root (the folder that contains docker-compose.yml)
 Copy-Item .env.example .env
@@ -42,4 +44,6 @@ The backend listens on `PORT` and runs migrations before Uvicorn. The frontend i
 6. Build the frontend with `--build-arg VITE_API_BASE_URL=https://YOUR_BACKEND_URL`.
 7. Verify `/health`, `/ready`, and `/api/v1/integrations/status`.
 
-Do not expose the prototype administrator token or deploy with the default `local-demo-admin` value. Real authentication/RBAC and distributed rate limiting are required before public production use.
+## Authentication in every deployment
+
+Sign-in does not work until the host provides `AUTH_SECRET` and `AUTH_USERS_JSON` (and, for the browser to reach the API, `FRONTEND_ORIGINS` and the frontend build variable `VITE_API_BASE_URL`). Generate the secret and the password hashes as described in the [README](../README.md#authentication-and-roles), store them in the host's secret manager, and follow the [hosted deployment checklist](ENVIRONMENT_VARIABLES.md#hosted-deployment-checklist). The previous shared `local-demo-admin` token no longer exists. An external identity provider and distributed rate limiting are still required before unrestricted public use.

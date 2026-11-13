@@ -10,8 +10,6 @@ from app.main import app
 from app.threat_intelligence import lookup_indicator
 
 
-ADMIN = {"X-Demo-Admin-Token": "local-demo-admin"}
-
 
 def test_demo_mode_forces_local_provider_and_identifies_sample_indicators():
     settings = Settings(
@@ -49,11 +47,10 @@ async def test_demo_mode_cloud_adapters_do_not_connect():
 @pytest.mark.asyncio
 async def test_simulation_events_create_explainable_incidents():
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        reset = await client.post("/api/v1/simulation/reset", headers=ADMIN)
+        reset = await client.post("/api/v1/simulation/reset")
         assert reset.status_code == 200
         started = await client.post(
             "/api/v1/simulation/start",
-            headers=ADMIN,
             json={"scenario": "unusual_traffic", "seed": 77, "event_count": 4},
         )
         incidents = await client.get("/api/v1/incidents")

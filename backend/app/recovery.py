@@ -167,6 +167,12 @@ async def consume_approval(
     parameters: dict[str, Any],
     principal: str,
 ) -> None:
+    """Use up one valid approval for exactly this incident, action and parameters.
+
+    The user executing must be the user who approved: an approval is bound to its approver (``principal`` is the
+    authenticated username of the executor), to the incident, the action, a hash of the parameters, an expiry time and the
+    revoked / consumed flags. It can be used once, and the claim below is a single conditional update.
+    """
     now = datetime.now(timezone.utc)
     approval = await session.scalar(
         select(RecoveryApproval)
@@ -273,7 +279,7 @@ async def execute_recovery(
             await consume_approval(session, incident, action, parameters, principal)
     except PolicyRejected as exc:
         await create_escalation(session, incident, str(exc), {"code": exc.code, "action_id": action_id}, "Administrator review required.")
-        session.add(AuditEvent(event_type="recovery.policy_rejected", message=str(exc), is_demo=service.simulation_status))
+        session.add(AuditEvent(event_type="recovery.policy_rejected", message=f"{exc} (requested by {principal})", is_demo=service.simulation_status))
         await session.commit()
         raise
     if incident.state == IncidentState.DETECTED:
@@ -293,6 +299,7 @@ async def execute_recovery(
     session.add(execution)
     await session.flush()
     session.add(IncidentEvent(incident_id=incident.id, event_type="RECOVERY_STARTED", description=action.description, metadata_json=json.dumps({"action_id": action.action_id, "parameters": parameters})))
+    session.add(AuditEvent(event_type="recovery.executed", message=f"Recovery {action.action_id} started for incident {incident.id} by {principal}", is_demo=service.simulation_status))
     await session.commit()
     try:
         await asyncio.wait_for(_apply_action(session, service, incident, action.action_id, parameters), timeout=action.timeout_seconds)

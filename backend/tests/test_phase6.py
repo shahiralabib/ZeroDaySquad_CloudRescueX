@@ -5,7 +5,6 @@ import pytest
 
 from app.cloud_adapters import CloudLoggingAdapter, CloudMonitoringAdapter, FirestoreAdapter
 from app.config import Settings
-from app.main import require_demo_admin, settings as app_settings
 
 
 @pytest.mark.asyncio
@@ -47,13 +46,3 @@ async def test_monitoring_and_logging_operations_fail_explicitly_when_unconfigur
             start_time=datetime.now(timezone.utc),
             end_time=datetime.now(timezone.utc),
         )
-
-
-def test_default_admin_token_is_rejected_outside_local_environment(monkeypatch):
-    monkeypatch.setattr(app_settings, "environment", "production")
-    monkeypatch.setattr(app_settings, "demo_admin_token", "local-demo-admin")
-
-    with pytest.raises(Exception) as error:
-        require_demo_admin("local-demo-admin")
-
-    assert getattr(error.value, "status_code", None) == 503

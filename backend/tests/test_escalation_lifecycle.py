@@ -9,8 +9,7 @@ from sqlalchemy import select
 
 from app.database import AuditEvent, Escalation, IncidentEvent, RecoveryApproval, session_factory
 from app.main import _request_windows, app
-
-ADMIN = {"X-Demo-Admin-Token": "local-demo-admin"}
+from auth_support import ANONYMOUS_HEADERS
 
 
 @pytest.fixture(autouse=True)
@@ -30,11 +29,11 @@ async def escalated_incident(client: AsyncClient) -> dict:
             json={"name": f"Escalation {uuid4()}", "environment": "demo", "simulation_status": True, "failure_threshold": 1},
         )
     ).json()
-    await client.post(f"/api/v1/demo/services/{service['id']}/fault", headers=ADMIN, json={"scenario": "configuration_failure"})
+    await client.post(f"/api/v1/demo/services/{service['id']}/fault", json={"scenario": "configuration_failure"})
     incident = next(i for i in (await client.get("/api/v1/incidents")).json() if i["service_id"] == service["id"])
     # A medium-risk action without approval is refused and escalates the incident.
     refused = await client.post(
-        f"/api/v1/incidents/{incident['id']}/recovery", headers=ADMIN, json={"action_id": "restore_known_good_configuration"}
+        f"/api/v1/incidents/{incident['id']}/recovery", json={"action_id": "restore_known_good_configuration"}
     )
     assert refused.status_code == 409
     return incident
@@ -49,17 +48,18 @@ async def pending_ids(client: AsyncClient) -> set[int]:
 
 
 async def acknowledge(client: AsyncClient, incident_id: int, escalation_id: int | None = None, token: bool = True):
-    suffix = f"&escalation_id={escalation_id}" if escalation_id is not None else ""
+    suffix = f"?escalation_id={escalation_id}" if escalation_id is not None else ""
     return await client.post(
-        f"/api/v1/incidents/{incident_id}/acknowledge?administrator=test-admin{suffix}", headers=ADMIN if token else {}
+        f"/api/v1/incidents/{incident_id}/acknowledge{suffix}",
+        headers=None if token else ANONYMOUS_HEADERS,  # token=False is an explicitly anonymous request
     )
 
 
 async def reject(client: AsyncClient, incident_id: int, escalation_id: int | None = None, reason: str = "Not safe to run"):
-    params = {"reason": reason, "administrator": "test-admin"}
+    params = {"reason": reason}
     if escalation_id is not None:
         params["escalation_id"] = escalation_id
-    return await client.post(f"/api/v1/incidents/{incident_id}/reject-recovery", headers=ADMIN, params=params)
+    return await client.post(f"/api/v1/incidents/{incident_id}/reject-recovery", params=params)
 
 
 # --- Acknowledge ----------------------------------------------------------------------------------------------------
@@ -191,12 +191,12 @@ async def test_rejecting_revokes_approvals_that_have_not_been_used():
     async with new_client() as client:
         incident = await escalated_incident(client)
         approval = await client.post(
-            f"/api/v1/incidents/{incident['id']}/recovery/approve", headers=ADMIN, json={"action_id": "restore_known_good_configuration"}
+            f"/api/v1/incidents/{incident['id']}/recovery/approve", json={"action_id": "restore_known_good_configuration"}
         )
         assert approval.status_code == 200
         await reject(client, incident["id"])
         attempt = await client.post(
-            f"/api/v1/incidents/{incident['id']}/recovery", headers=ADMIN, json={"action_id": "restore_known_good_configuration"}
+            f"/api/v1/incidents/{incident['id']}/recovery", json={"action_id": "restore_known_good_configuration"}
         )
 
     assert attempt.status_code == 409  # the approved-but-unused recovery can no longer run
@@ -214,7 +214,7 @@ async def test_rejecting_an_incident_that_was_never_escalated_escalates_it_and_r
                 json={"name": f"Reject {uuid4()}", "environment": "demo", "simulation_status": True, "failure_threshold": 1},
             )
         ).json()
-        await client.post(f"/api/v1/demo/services/{service['id']}/fault", headers=ADMIN, json={"scenario": "service_unavailable"})
+        await client.post(f"/api/v1/demo/services/{service['id']}/fault", json={"scenario": "service_unavailable"})
         incident = next(i for i in (await client.get("/api/v1/incidents")).json() if i["service_id"] == service["id"])
         assert await escalations_of(client, incident["id"]) == []
 
@@ -283,14 +283,12 @@ async def test_error_responses_are_specific():
         unknown_incident = await acknowledge(client, 99999999)
         no_token = await acknowledge(client, incident["id"], mine["id"], token=False)
         bad_filter = await client.get("/api/v1/escalations?status=bogus")
-        bad_admin = await client.post(
-            f"/api/v1/incidents/{incident['id']}/acknowledge?administrator=" + "x" * 121, headers=ADMIN
-        )
+        bad_escalation_id = await client.post(f"/api/v1/incidents/{incident['id']}/acknowledge?escalation_id=0")
         still_pending = await pending_ids(client)
 
     assert wrong_incident.status_code == 404 and missing.status_code == 404 and unknown_incident.status_code == 404
     assert no_token.status_code == 401
-    assert bad_filter.status_code == 422 and bad_admin.status_code == 422
+    assert bad_filter.status_code == 422 and bad_escalation_id.status_code == 422
     assert mine["id"] in still_pending  # none of the failed attempts changed anything
 
 

@@ -4,9 +4,8 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from app.main import app
+from auth_support import ANONYMOUS_HEADERS
 
-
-ADMIN = {"X-Demo-Admin-Token": "local-demo-admin"}
 
 
 async def setup_incident(client: AsyncClient, scenario: str = "service_unavailable") -> dict:
@@ -21,7 +20,7 @@ async def setup_incident(client: AsyncClient, scenario: str = "service_unavailab
             },
         )
     ).json()
-    await client.post(f"/api/v1/demo/services/{service['id']}/fault", headers=ADMIN, json={"scenario": scenario})
+    await client.post(f"/api/v1/demo/services/{service['id']}/fault", json={"scenario": scenario})
     await client.post(f"/api/v1/services/{service['id']}/health")
     return next(item for item in (await client.get("/api/v1/incidents")).json() if item["service_id"] == service["id"])
 
@@ -32,7 +31,6 @@ async def test_approved_recovery_requires_independent_verification():
         incident = await setup_incident(client)
         response = await client.post(
             f"/api/v1/incidents/{incident['id']}/recovery",
-            headers=ADMIN,
             json={"action_id": "restart_demo_application"},
         )
         detail = await client.get(f"/api/v1/incidents/{incident['id']}")
@@ -49,16 +47,15 @@ async def test_unknown_invalid_and_unauthorized_recovery_are_rejected():
         incident = await setup_incident(client)
         unauthorized = await client.post(
             f"/api/v1/incidents/{incident['id']}/recovery",
+            headers=ANONYMOUS_HEADERS,  # explicitly anonymous: the default test client is authenticated
             json={"action_id": "restart_demo_application"},
         )
         unknown = await client.post(
             f"/api/v1/incidents/{incident['id']}/recovery",
-            headers=ADMIN,
             json={"action_id": "run_shell_command"},
         )
         invalid = await client.post(
             f"/api/v1/incidents/{incident['id']}/recovery",
-            headers=ADMIN,
             json={"action_id": "scale_demo_application", "parameters": {"instances": 2}, "approved": True},
         )
     assert unauthorized.status_code == 401
@@ -72,17 +69,14 @@ async def test_high_risk_action_requires_administrator_approval():
         incident = await setup_incident(client)
         rejected = await client.post(
             f"/api/v1/incidents/{incident['id']}/recovery",
-            headers=ADMIN,
             json={"action_id": "reset_demo_environment"},
         )
         approved = await client.post(
             f"/api/v1/incidents/{incident['id']}/recovery/approve",
-            headers=ADMIN,
             json={"action_id": "reset_demo_environment"},
         )
         executed = await client.post(
             f"/api/v1/incidents/{incident['id']}/recovery",
-            headers=ADMIN,
             json={"action_id": "reset_demo_environment", "approved": True},
         )
     assert rejected.status_code == 409
@@ -97,15 +91,11 @@ async def test_policy_rejection_creates_escalation_notification_and_acknowledgem
         incident = await setup_incident(client)
         await client.post(
             f"/api/v1/incidents/{incident['id']}/recovery",
-            headers=ADMIN,
             json={"action_id": "restart_demo_application", "parameters": {"unexpected": True}},
         )
         escalations = await client.get(f"/api/v1/incidents/{incident['id']}/escalation")
         notifications = await client.get("/api/v1/notifications")
-        acknowledged = await client.post(
-            f"/api/v1/incidents/{incident['id']}/acknowledge?administrator=test-admin",
-            headers=ADMIN,
-        )
+        acknowledged = await client.post(f"/api/v1/incidents/{incident['id']}/acknowledge")
         timeline = await client.get(f"/api/v1/incidents/{incident['id']}/timeline")
     assert escalations.status_code == 200
     assert escalations.json()[0]["reason"]
@@ -127,7 +117,6 @@ async def test_failed_verification_escalates(monkeypatch):
         incident = await setup_incident(client)
         response = await client.post(
             f"/api/v1/incidents/{incident['id']}/recovery",
-            headers=ADMIN,
             json={"action_id": "restart_demo_application"},
         )
         detail = await client.get(f"/api/v1/incidents/{incident['id']}")

@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { NavLink, useLocation, useNavigate } from "react-router-dom";
-import { Activity, Bell, Boxes, ChevronsLeft, ChevronsRight, CircleHelp, FlaskConical, History, LayoutDashboard, Menu, Search, Settings, ShieldAlert, ShieldCheck, Siren, X } from "lucide-react";
+import { Activity, Bell, Boxes, ChevronsLeft, ChevronsRight, CircleHelp, FlaskConical, History, LayoutDashboard, LogOut, Menu, Search, Settings, ShieldAlert, ShieldCheck, Siren, X } from "lucide-react";
 import { fetchHealth, fetchNotifications } from "../lib/api";
+import { useAuth } from "./AuthContext";
 
 const navigation = [
   { label: "Overview", path: "/", icon: LayoutDashboard },
@@ -36,6 +37,7 @@ export function Layout({ children }: { children: ReactNode }) {
   const [unreadNotifications, setUnreadNotifications] = useState(0);
   const [apiStatus, setApiStatus] = useState<"checking" | "connected" | "unavailable">("checking");
   const [environment, setEnvironment] = useState<EnvironmentState>({ state: "loading" });
+  const { user, logout } = useAuth();
   const location = useLocation();
   const navigate = useNavigate();
   const currentLabel = useMemo(() => [...navigation, ...administration].find((item) => item.path === location.pathname || (item.path !== "/" && location.pathname.startsWith(`${item.path}/`)))?.label ?? "Overview", [location.pathname]);
@@ -99,7 +101,8 @@ export function Layout({ children }: { children: ReactNode }) {
             <label className="soc-search"><Search size={15} /><input aria-label="Search incidents, services, or users" placeholder="Search anything..." onKeyDown={(event) => { if (event.key === "Enter") { goToIncidents(); event.currentTarget.blur(); } }} /><kbd>⌘ K</kbd></label>
             <div className="relative"><button className={`soc-icon-button ${notificationsOpen ? "soc-icon-button-selected" : ""}`} aria-label={`Notifications, ${unreadNotifications} unread`} onClick={() => setNotificationsOpen(!notificationsOpen)}><Bell size={18} />{unreadNotifications > 0 && <span className="soc-notification-dot" />}</button>{notificationsOpen && <div className="soc-notification-popover"><strong>Notifications</strong><span>{unreadNotifications} unread</span><button onClick={() => { navigate("/notifications"); setNotificationsOpen(false); }}>View all notifications</button></div>}</div>
             <div className="soc-topbar-separator" />
-            <div className="soc-operator"><div className="soc-operator-avatar">OP</div><div className="soc-nav-label"><strong>Operator</strong><span><i />Authenticated</span></div></div>
+            <div className="soc-operator" title={user ? `Signed in as ${user.username} (${user.role})` : undefined}><div className="soc-operator-avatar">{(user?.username ?? "?").slice(0, 2).toUpperCase()}</div><div className="soc-nav-label"><strong>{user?.username ?? "Signed in"}</strong><span><i />{user ? `${user.role.charAt(0).toUpperCase()}${user.role.slice(1)}` : "Authenticated"}</span></div></div>
+            <button className="soc-icon-button" aria-label="Sign out" title="Sign out" onClick={logout}><LogOut size={17} /></button>
           </div>
         </header>
         <main className="soc-content-area">{children}</main>

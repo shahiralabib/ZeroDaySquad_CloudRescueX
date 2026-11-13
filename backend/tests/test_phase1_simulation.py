@@ -2,9 +2,8 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from app.main import app
+from auth_support import ANONYMOUS_HEADERS
 
-
-ADMIN_HEADERS = {"X-Demo-Admin-Token": "local-demo-admin"}
 
 
 async def simulation_client():
@@ -17,7 +16,7 @@ async def simulation_client():
 @pytest.mark.asyncio
 async def test_simulation_resources_have_relationships_and_persisted_metadata():
     async with await simulation_client() as client:
-        await client.post("/api/v1/simulation/reset", headers=ADMIN_HEADERS)
+        await client.post("/api/v1/simulation/reset")
         response = await client.get("/api/v1/simulation/resources")
         status_response = await client.get("/api/v1/simulation/status")
 
@@ -39,14 +38,14 @@ async def test_simulation_resources_have_relationships_and_persisted_metadata():
 @pytest.mark.asyncio
 async def test_simulation_start_filters_and_deterministically_replays_events():
     async with await simulation_client() as client:
-        await client.post("/api/v1/simulation/reset", headers=ADMIN_HEADERS)
+        await client.post("/api/v1/simulation/reset")
         unauthorized = await client.post(
             "/api/v1/simulation/start",
+            headers=ANONYMOUS_HEADERS,  # explicitly anonymous: the default test client is authenticated
             json={"scenario": "authentication_attack", "seed": 42, "event_count": 6},
         )
         started = await client.post(
             "/api/v1/simulation/start",
-            headers=ADMIN_HEADERS,
             json={"scenario": "authentication_attack", "seed": 42, "event_count": 6},
         )
         events = await client.get(
@@ -54,10 +53,9 @@ async def test_simulation_start_filters_and_deterministically_replays_events():
             params={"category": "authentication", "severity": "high", "limit": 2},
         )
         first_run = await client.get("/api/v1/simulation/events", params={"limit": 100})
-        reset = await client.post("/api/v1/simulation/reset", headers=ADMIN_HEADERS)
+        reset = await client.post("/api/v1/simulation/reset")
         replay = await client.post(
             "/api/v1/simulation/start",
-            headers=ADMIN_HEADERS,
             json={"scenario": "authentication_attack", "seed": 42, "event_count": 6},
         )
         second_run = await client.get("/api/v1/simulation/events", params={"limit": 100})
@@ -86,7 +84,6 @@ async def test_simulation_validation_and_pagination_errors():
     async with await simulation_client() as client:
         invalid_scenario = await client.post(
             "/api/v1/simulation/start",
-            headers=ADMIN_HEADERS,
             json={"scenario": "unknown"},
         )
         invalid_window = await client.get(

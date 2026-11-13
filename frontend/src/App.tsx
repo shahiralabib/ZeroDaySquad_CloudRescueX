@@ -1,4 +1,6 @@
 import { BrowserRouter, Route, Routes } from "react-router-dom";
+import { AuthGate } from "./components/AuthGate";
+import { AuthProvider } from "./components/AuthContext";
 import { Layout } from "./components/Layout";
 import { Overview } from "./pages/Overview";
 import { Placeholder } from "./pages/Placeholder";
@@ -13,7 +15,7 @@ import { Settings } from "./pages/Settings";
 import "./styles.css";
 
 export default function App() {
-  return <BrowserRouter><Layout><Routes>
+  return <BrowserRouter><AuthProvider><AuthGate><Layout><Routes>
     <Route path="/" element={<Overview />} />
     <Route path="/incidents" element={<Incidents />} />
     <Route path="/incidents/:incidentId" element={<IncidentDetail />} />
@@ -24,5 +26,5 @@ export default function App() {
     <Route path="/escalations" element={<Escalations />} />
     <Route path="/settings" element={<Settings />} />
     <Route path="*" element={<Placeholder title="Page not found" description="The requested workspace view does not exist." />} />
-  </Routes></Layout></BrowserRouter>;
+  </Routes></Layout></AuthGate></AuthProvider></BrowserRouter>;
 }

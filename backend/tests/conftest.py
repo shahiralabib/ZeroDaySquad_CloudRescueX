@@ -32,6 +32,16 @@ DEMO_DATABASE_FILE = BACKEND_DIR / "cloudrescue.db"
 
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
+if str(Path(__file__).resolve().parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))  # lets test modules ``import auth_support``
+
+from auth_support import (  # noqa: E402  (plain constants; imports nothing from ``app``)
+    DEFAULT_TEST_USER,
+    TEST_AUTH_SECRET,
+    TEST_AUTH_USERS_JSON,
+    TEST_TOKEN_TTL_MINUTES,
+    TEST_USER_ROLES,
+)
 
 if "app.config" in sys.modules or "app.database" in sys.modules:
     raise RuntimeError(
@@ -95,3 +105,91 @@ def pytest_unconfigure(config: pytest.Config) -> None:
             pass
     if _TEST_DB_DIR.parent == Path(tempfile.gettempdir()).resolve() and _TEST_DB_DIR.name.startswith("cloudrescuex-tests-"):
         shutil.rmtree(_TEST_DB_DIR, ignore_errors=True)
+
+
+# --- authentication for the test suite ---------------------------------------------------------------------------------
+#
+# Production code requires signed bearer tokens (app/auth.py). So that the existing API tests keep working once routes are
+# protected, every test runs with a fixed, test-only authentication configuration, and every ``httpx.AsyncClient`` that
+# talks to the application in-process sends a valid ``Authorization: Bearer`` header for ``test-admin`` by default.
+#
+# Anonymous requests are always explicit:
+#   * one request:   ``client.get(url, headers=ANONYMOUS_HEADERS)``    (``from auth_support import ANONYMOUS_HEADERS``)
+#   * one client:    ``AsyncClient(..., headers=ANONYMOUS_HEADERS)``
+#   * a whole test or module:  ``@pytest.mark.anonymous`` / ``pytestmark = pytest.mark.anonymous``
+# A client that sets its own ``Authorization`` header (or ``auth=``) keeps it, and a client for any other application or
+# transport is never touched. Other users: ``auth_headers("test-viewer")``.
+#
+# Nothing here is a fallback for the application: the credentials exist only on the shared settings object, only while a
+# test runs (pytest's ``monkeypatch`` restores it), and the application's own defaults stay empty.
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    config.addinivalue_line(
+        "markers", "anonymous: in-process HTTP clients created by this test send no Authorization header by default"
+    )
+
+
+class AuthTestHelper:
+    """Hands out bearer headers for the fixed test users."""
+
+
+    def __init__(self) -> None:
+        from pydantic import SecretStr
+
+        from app.config import Settings
+
+        # Built from the fixed constants, not from the shared settings object, so a test that temporarily installs a
+        # different configuration there still gets tokens for the test users.
+        self._settings = Settings(
+            _env_file=None,
+            auth_secret=SecretStr(TEST_AUTH_SECRET),
+            auth_users_json=SecretStr(TEST_AUTH_USERS_JSON),
+            auth_token_ttl_minutes=TEST_TOKEN_TTL_MINUTES,
+        )
+
+    def headers(self, username: str = DEFAULT_TEST_USER) -> dict[str, str]:
+        """``{"Authorization": "Bearer <fresh signed token>"}`` for one of the test users."""
+        from app.auth import issue_token, load_auth_config
+
+        if username not in TEST_USER_ROLES:
+            raise ValueError(f"{username!r} is not a test user (known: {', '.join(TEST_USER_ROLES)}).")
+        config = load_auth_config(self._settings)
+        return {"Authorization": f"Bearer {issue_token(config, config.users[username]).token}"}
+
+
+@pytest.fixture(autouse=True)
+def authentication_environment(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> AuthTestHelper:
+    from httpx import ASGITransport, AsyncClient
+    from pydantic import SecretStr
+
+    from app import main as main_module
+    from app.auth import clear_auth_config_cache
+    from app.config import get_settings
+
+    settings = get_settings()
+    monkeypatch.setattr(settings, "auth_secret", SecretStr(TEST_AUTH_SECRET))
+    monkeypatch.setattr(settings, "auth_users_json", SecretStr(TEST_AUTH_USERS_JSON))
+    monkeypatch.setattr(settings, "auth_token_ttl_minutes", TEST_TOKEN_TTL_MINUTES)
+    clear_auth_config_cache()
+
+    authentication = AuthTestHelper()
+    if request.node.get_closest_marker("anonymous") is None:
+        default_headers = authentication.headers(DEFAULT_TEST_USER)
+        original_init = AsyncClient.__init__
+
+        def init_with_default_authorization(self, *args, **kwargs):
+            original_init(self, *args, **kwargs)
+            transport = kwargs.get("transport")
+            talks_to_the_application = isinstance(transport, ASGITransport) and transport.app is main_module.app
+            if talks_to_the_application and kwargs.get("auth") is None and "authorization" not in self.headers:
+                self.headers["Authorization"] = default_headers["Authorization"]
+
+        monkeypatch.setattr(AsyncClient, "__init__", init_with_default_authorization)
+    return authentication
+
+
+@pytest.fixture
+def auth_headers(authentication_environment: AuthTestHelper):
+    """``auth_headers("test-viewer")`` -> ``{"Authorization": "Bearer ..."}``; defaults to ``test-admin``."""
+    return authentication_environment.headers

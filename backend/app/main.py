@@ -5,13 +5,15 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
+from app.auth import Principal
+from app.auth_routes import require_admin, require_operator, require_viewer, router as auth_router
 from app.ai import (
     AIProviderError,
     InvestigationInput,
@@ -109,6 +111,18 @@ def json_dict(value: str | None) -> dict[str, object]:
     except json.JSONDecodeError:
         return {"raw": value}
     return parsed if isinstance(parsed, dict) else {"value": parsed}
+
+
+def audit(session: AsyncSession, principal: Principal, event_type: str, message: str, *, is_demo: bool | None = None) -> None:
+    """Record who did what. The name is the authenticated user from the server's configuration, never a request value.
+    The record is part of the caller's transaction: it is stored if, and only if, the action it describes is committed."""
+    session.add(
+        AuditEvent(
+            event_type=event_type,
+            message=f"{message} by {principal.username}",
+            is_demo=settings.demo_mode if is_demo is None else is_demo,
+        )
+    )
 
 
 def service_response(service: Service) -> ServiceResponse:
@@ -234,18 +248,31 @@ async def lifespan(_: FastAPI):
         await engine.dispose()
 
 
+DOCS_ENVIRONMENTS = frozenset({"local", "demo", "test"})
+
+
+def documentation_urls(environment: str) -> dict[str, str | None]:
+    """Where the interactive API documentation is served. It is public (it describes the API, it does not expose data)
+    in the local, demo and test environments and not served at all anywhere else."""
+    if environment.strip().lower() in DOCS_ENVIRONMENTS:
+        return {"docs_url": "/docs", "redoc_url": "/redoc", "openapi_url": "/openapi.json"}
+    return {"docs_url": None, "redoc_url": None, "openapi_url": None}
+
+
 app = FastAPI(
     title=settings.app_name,
     version="0.2.0",
     lifespan=lifespan,
     responses={500: {"model": ErrorResponse}},
+    **documentation_urls(settings.environment),
 )
+# Access is by bearer token in the Authorization header, never by cookie, so browsers are not asked to send credentials.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins,
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["GET", "POST", "PATCH", "OPTIONS"],
-    allow_headers=["*"],
+    allow_headers=["Authorization", "Content-Type", "X-Correlation-ID"],
 )
 
 
@@ -301,7 +328,11 @@ async def readiness(session: AsyncSession = Depends(get_session)) -> HealthRespo
     )
 
 
-api = APIRouter()
+# Access policy: every route on this router requires a signed-in user (viewer or higher) by default, which also makes a
+# forgotten route safe. A route that does more than read adds ``Depends(require_operator)`` or ``Depends(require_admin)``;
+# the effective requirement is the strictest one. tests/test_route_access.py pins the policy of every route.
+# Public by design, and defined elsewhere: GET /health, GET /ready, POST /api/v1/auth/login.
+api = APIRouter(dependencies=[Depends(require_viewer)])
 
 
 @api.get("/mode", response_model=OperatingModeResponse, tags=["system"])
@@ -379,10 +410,9 @@ async def simulation_events(
 @api.post("/simulation/start", response_model=SimulationStateResponse, tags=["simulation"])
 async def start_simulation(
     payload: SimulationStartRequest,
-    x_demo_admin_token: str | None = Header(default=None),
+    principal: Principal = Depends(require_admin),
     session: AsyncSession = Depends(get_session),
 ) -> SimulationStateResponse:
-    require_demo_admin(x_demo_admin_token)
     if payload.scenario not in SCENARIOS:
         raise HTTPException(status_code=422, detail={"code": "UNKNOWN_SCENARIO", "scenarios": sorted(SCENARIOS)})
     state = await ensure_simulation_data(session)
@@ -393,45 +423,46 @@ async def start_simulation(
     state.stopped_at = None
     records = await generate_events(session, state, payload.event_count, payload.seed)
     await detect_telemetry(session, records)
+    audit(session, principal, "simulation.started", f"Simulation {payload.scenario} started (seed {payload.seed}, {payload.event_count} events)")
     await session.commit()
     return simulation_state_response(state)
 
 
 @api.post("/simulation/tick", response_model=SimulationStateResponse, tags=["simulation"])
 async def simulation_tick(
-    x_demo_admin_token: str | None = Header(default=None),
+    principal: Principal = Depends(require_admin),
     session: AsyncSession = Depends(get_session),
 ) -> SimulationStateResponse:
-    require_demo_admin(x_demo_admin_token)
     state = await ensure_simulation_data(session)
     if state.status != "running":
         raise HTTPException(status_code=409, detail="Simulation must be running before a tick.")
     records = await generate_events(session, state, 10)
     await detect_telemetry(session, records)
+    audit(session, principal, "simulation.tick", "Simulation advanced by one tick")
     await session.commit()
     return simulation_state_response(state)
 
 
 @api.post("/simulation/stop", response_model=SimulationStateResponse, tags=["simulation"])
 async def stop_simulation(
-    x_demo_admin_token: str | None = Header(default=None),
+    principal: Principal = Depends(require_admin),
     session: AsyncSession = Depends(get_session),
 ) -> SimulationStateResponse:
-    require_demo_admin(x_demo_admin_token)
     state = await ensure_simulation_data(session)
     state.status = "stopped"
     state.stopped_at = datetime.now(timezone.utc)
+    audit(session, principal, "simulation.stopped", "Simulation stopped")
     await session.commit()
     return simulation_state_response(state)
 
 
 @api.post("/simulation/reset", response_model=SimulationStateResponse, tags=["simulation"])
 async def reset_local_simulation(
-    x_demo_admin_token: str | None = Header(default=None),
+    principal: Principal = Depends(require_admin),
     session: AsyncSession = Depends(get_session),
 ) -> SimulationStateResponse:
-    require_demo_admin(x_demo_admin_token)
     state = await reset_simulation(session)
+    audit(session, principal, "simulation.reset", "Simulation reset to its baseline")
     await session.commit()
     return simulation_state_response(state)
 
@@ -520,7 +551,11 @@ async def get_service(service_id: int, session: AsyncSession = Depends(get_sessi
 
 
 @api.post("/services", response_model=ServiceResponse, status_code=201, tags=["services"])
-async def create_service(payload: ServiceCreate, session: AsyncSession = Depends(get_session)) -> ServiceResponse:
+async def create_service(
+    payload: ServiceCreate,
+    principal: Principal = Depends(require_admin),
+    session: AsyncSession = Depends(get_session),
+) -> ServiceResponse:
     service = Service(
         name=payload.name,
         description=payload.description,
@@ -534,13 +569,19 @@ async def create_service(payload: ServiceCreate, session: AsyncSession = Depends
     session.add(service)
     await session.flush()
     session.add(DemoFault(service_id=service.id, scenario="healthy"))
+    audit(session, principal, "service.created", f"Service {service.id} ({service.name}) created", is_demo=service.simulation_status)
     await session.commit()
     await session.refresh(service)
     return service_response(service)
 
 
 @api.patch("/services/{service_id}", response_model=ServiceResponse, tags=["services"])
-async def update_service(service_id: int, payload: ServiceUpdate, session: AsyncSession = Depends(get_session)) -> ServiceResponse:
+async def update_service(
+    service_id: int,
+    payload: ServiceUpdate,
+    principal: Principal = Depends(require_admin),
+    session: AsyncSession = Depends(get_session),
+) -> ServiceResponse:
     service = await session.get(Service, service_id)
     if service is None:
         raise HTTPException(status_code=404, detail="Service not found")
@@ -551,6 +592,7 @@ async def update_service(service_id: int, payload: ServiceUpdate, session: Async
         if key == "enabled":
             continue
         setattr(service, key, value)
+    audit(session, principal, "service.updated", f"Service {service.id} updated (fields: {', '.join(sorted(updates)) or 'none'})", is_demo=service.simulation_status)
     await session.commit()
     await session.refresh(service)
     return service_response(service)
@@ -565,7 +607,7 @@ async def service_health(service_id: int, session: AsyncSession = Depends(get_se
 
 
 @api.post("/services/{service_id}/health", response_model=HealthCheckResponse, tags=["health checks"])
-async def run_health_check(service_id: int) -> HealthCheckResponse:
+async def run_health_check(service_id: int, principal: Principal = Depends(require_operator)) -> HealthCheckResponse:
     try:
         return check_response(await monitoring.check_service(service_id))
     except ValueError as exc:
@@ -587,7 +629,13 @@ async def get_incident(incident_id: int, session: AsyncSession = Depends(get_ses
 
 
 @api.patch("/incidents/{incident_id}/state", response_model=IncidentResponse, tags=["incidents"])
-async def transition_incident(incident_id: int, payload: IncidentStateUpdate, session: AsyncSession = Depends(get_session)) -> IncidentResponse:
+async def transition_incident(
+    incident_id: int,
+    payload: IncidentStateUpdate,
+    principal: Principal = Depends(require_admin),
+    session: AsyncSession = Depends(get_session),
+) -> IncidentResponse:
+    """Manual state change (including manual resolution). It overrides the automated workflow, so it is admin only."""
     row = (await session.execute(select(Incident, Service.name).join(Service).where(Incident.id == incident_id))).first()
     if row is None:
         raise HTTPException(status_code=404, detail="Incident not found")
@@ -596,13 +644,15 @@ async def transition_incident(incident_id: int, payload: IncidentStateUpdate, se
         validate_transition(incident.state, payload.target_state)
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    previous_state = incident.state
     incident.state = payload.target_state
     if payload.target_state == IncidentState.RESOLVED:
         incident.resolution_timestamp = datetime.now(timezone.utc)
     event_type = "RESOLUTION" if payload.target_state == IncidentState.RESOLVED else "POLICY_DECISION"
     if event_type not in TIMELINE_EVENT_TYPES:
         event_type = "POLICY_DECISION"
-    session.add(IncidentEvent(incident_id=incident.id, event_type=event_type, description=payload.description or f"Incident moved to {payload.target_state}.", metadata_json=json.dumps({"target_state": payload.target_state})))
+    session.add(IncidentEvent(incident_id=incident.id, event_type=event_type, description=payload.description or f"Incident moved to {payload.target_state}.", metadata_json=json.dumps({"target_state": payload.target_state, "changed_by": principal.username})))
+    audit(session, principal, "incident.state_changed", f"Incident {incident.id} moved {previous_state} -> {payload.target_state}", is_demo=incident.is_demo)
     await session.commit()
     return incident_response(incident, service_name)
 
@@ -706,7 +756,8 @@ async def ai_status() -> ProviderStatusResponse:
 
 
 @api.post("/ai/test", response_model=ProviderStatusResponse, tags=["ai"])
-async def ai_test() -> ProviderStatusResponse:
+async def ai_test(principal: Principal = Depends(require_admin)) -> ProviderStatusResponse:
+    """Makes a real, authenticated request to the configured AI provider with the server's credentials."""
     provider = get_provider()
     try:
         return ProviderStatusResponse(**(await provider.test_connection()).__dict__)
@@ -715,13 +766,18 @@ async def ai_test() -> ProviderStatusResponse:
 
 
 @api.get("/integrations/status", response_model=list[IntegrationStatusResponse], tags=["integrations"])
-async def integrations_status() -> list[IntegrationStatusResponse]:
+async def integrations_status(principal: Principal = Depends(require_operator)) -> list[IntegrationStatusResponse]:
+    """Probes each cloud integration with the server's credentials, so it is an operational action, not a plain read."""
     statuses = await integration_statuses(settings)
     return [IntegrationStatusResponse(**status.__dict__) for status in statuses]
 
 
 @api.post("/incidents/{incident_id}/investigations", response_model=InvestigationResponse, status_code=201, tags=["ai investigations"])
-async def investigate_incident(incident_id: int, session: AsyncSession = Depends(get_session)) -> InvestigationResponse:
+async def investigate_incident(
+    incident_id: int,
+    principal: Principal = Depends(require_operator),
+    session: AsyncSession = Depends(get_session),
+) -> InvestigationResponse:
     row = (await session.execute(select(Incident, Service).join(Service).where(Incident.id == incident_id))).first()
     if row is None:
         raise HTTPException(status_code=404, detail="Incident not found")
@@ -743,9 +799,10 @@ async def investigate_incident(incident_id: int, session: AsyncSession = Depends
             incident_id=incident.id,
             event_type="INVESTIGATION_STARTED",
             description=f"Investigation started with {provider.name}.",
-            metadata_json=json.dumps({"provider": provider.name, "simulated": provider.simulated}),
+            metadata_json=json.dumps({"provider": provider.name, "simulated": provider.simulated, "started_by": principal.username}),
         )
     )
+    audit(session, principal, "investigation.started", f"Investigation {record.id} started for incident {incident.id} with {provider.name}", is_demo=incident.is_demo)
     await session.commit()
     evidence = await build_investigation_input(session, incident, service)
     try:
@@ -866,10 +923,9 @@ async def recovery_actions() -> list[RecoveryActionResponse]:
 async def approve_recovery(
     incident_id: int,
     payload: RecoveryRequest,
-    x_demo_admin_token: str | None = Header(default=None),
+    principal: Principal = Depends(require_admin),
     session: AsyncSession = Depends(get_session),
 ) -> IncidentResponse:
-    require_demo_admin(x_demo_admin_token)
     row = (await session.execute(select(Incident, Service).join(Service).where(Incident.id == incident_id))).first()
     if row is None:
         raise HTTPException(status_code=404, detail="Incident not found")
@@ -899,7 +955,7 @@ async def approve_recovery(
             incident_id=incident.id,
             action_id=action.action_id,
             parameters_hash=parameters_hash(payload.parameters),
-            approver_principal="shared_operator",
+            approver_principal=principal.username,
             created_at=now,
             expires_at=now + timedelta(minutes=settings.recovery_approval_expiry_minutes),
         )
@@ -909,10 +965,10 @@ async def approve_recovery(
             incident_id=incident.id,
             event_type="POLICY_DECISION",
             description=f"Administrator approved {payload.action_id}.",
-            metadata_json=json.dumps({"action_id": payload.action_id, "parameters": payload.parameters, "approval_id": approval_id}),
+            metadata_json=json.dumps({"action_id": payload.action_id, "parameters": payload.parameters, "approval_id": approval_id, "approved_by": principal.username}),
         )
     )
-    session.add(AuditEvent(event_type="recovery.approved", message=f"Approved {payload.action_id} for incident {incident.id} with approval {approval_id}", is_demo=incident.is_demo))
+    audit(session, principal, "recovery.approved", f"Approved {payload.action_id} for incident {incident.id} with approval {approval_id}", is_demo=incident.is_demo)
     await session.commit()
     return incident_response(incident, service_name)
 
@@ -921,17 +977,16 @@ async def approve_recovery(
 async def recover_incident(
     incident_id: int,
     payload: RecoveryRequest,
-    x_demo_admin_token: str | None = Header(default=None),
+    principal: Principal = Depends(require_operator),
     session: AsyncSession = Depends(get_session),
 ) -> RecoveryExecutionResponse:
-    require_demo_admin(x_demo_admin_token)
     row = (await session.execute(select(Incident, Service).join(Service).where(Incident.id == incident_id))).first()
     if row is None:
         raise HTTPException(status_code=404, detail="Incident not found")
     incident, service = row
     try:
         execution, _ = await execute_recovery(
-            session, monitoring, incident, service, payload.action_id, payload.parameters, "shared_operator"
+            session, monitoring, incident, service, payload.action_id, payload.parameters, principal.username
         )
     except PolicyRejected as exc:
         raise HTTPException(status_code=409, detail={"code": exc.code, "message": str(exc)}) from exc
@@ -990,15 +1045,17 @@ def _escalation_error(exc: Exception) -> HTTPException:
 @api.post("/incidents/{incident_id}/acknowledge", response_model=EscalationResponse, tags=["escalation"])
 async def acknowledge_incident(
     incident_id: int,
-    administrator: str = Query(default="local-admin", min_length=1, max_length=120),
     escalation_id: int | None = Query(default=None, ge=1),
-    x_demo_admin_token: str | None = Header(default=None),
+    principal: Principal = Depends(require_operator),
     session: AsyncSession = Depends(get_session),
 ) -> EscalationResponse:
-    """Acknowledge one escalation (``escalation_id``, or the incident's newest pending one). Idempotency: a second call is a 409."""
-    require_demo_admin(x_demo_admin_token)
+    """Acknowledge one escalation (``escalation_id``, or the incident's newest pending one). Idempotency: a second call is a 409.
+
+    The acknowledging user is the authenticated caller. A former ``administrator`` query parameter is ignored, so nobody
+    can record an action under another name.
+    """
     try:
-        escalation = await process_escalation(session, incident_id, escalation_id, STATUS_ACKNOWLEDGED, administrator)
+        escalation = await process_escalation(session, incident_id, escalation_id, STATUS_ACKNOWLEDGED, principal.username)
     except (EscalationNotFound, EscalationConflict) as exc:
         await session.rollback()
         raise _escalation_error(exc) from exc
@@ -1010,17 +1067,17 @@ async def acknowledge_incident(
 async def reject_recovery(
     incident_id: int,
     reason: str = Query(default="Administrator rejected the proposed recovery action.", min_length=1, max_length=500),
-    administrator: str = Query(default="local-admin", min_length=1, max_length=120),
     escalation_id: int | None = Query(default=None, ge=1),
-    x_demo_admin_token: str | None = Header(default=None),
+    principal: Principal = Depends(require_admin),
     session: AsyncSession = Depends(get_session),
 ) -> EscalationResponse:
     """Reject the proposed recovery of one escalation and record the decision.
 
     The escalation and the decision stay in history, unused approvals for the incident are revoked, and the incident is
     NOT resolved: it stays open for manual handling. An incident that was never escalated is escalated first.
+    The rejecting user is the authenticated caller (a former ``administrator`` query parameter is ignored).
     """
-    require_demo_admin(x_demo_admin_token)
+    administrator = principal.username
     incident = await session.get(Incident, incident_id)
     if incident is None:
         raise HTTPException(status_code=404, detail="Incident not found")
@@ -1050,10 +1107,9 @@ async def reject_recovery(
 @api.post("/incidents/{incident_id}/under-investigation", response_model=IncidentResponse, tags=["escalation"])
 async def mark_under_investigation(
     incident_id: int,
-    x_demo_admin_token: str | None = Header(default=None),
+    principal: Principal = Depends(require_operator),
     session: AsyncSession = Depends(get_session),
 ) -> IncidentResponse:
-    require_demo_admin(x_demo_admin_token)
     row = (await session.execute(select(Incident, Service.name).join(Service).where(Incident.id == incident_id))).first()
     if row is None:
         raise HTTPException(status_code=404, detail="Incident not found")
@@ -1063,8 +1119,8 @@ async def mark_under_investigation(
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     incident.state = IncidentState.INVESTIGATING
-    session.add(AuditEvent(event_type="incident.under_investigation", message=f"Incident {incident.id} marked under investigation", is_demo=incident.is_demo))
-    session.add(IncidentEvent(incident_id=incident.id, event_type="ADMIN_ACKNOWLEDGED", description="Administrator marked incident under investigation.", metadata_json="{}"))
+    audit(session, principal, "incident.under_investigation", f"Incident {incident.id} marked under investigation", is_demo=incident.is_demo)
+    session.add(IncidentEvent(incident_id=incident.id, event_type="ADMIN_ACKNOWLEDGED", description="Administrator marked incident under investigation.", metadata_json=json.dumps({"marked_by": principal.username})))
     await session.commit()
     return incident_response(incident, service_name)
 
@@ -1073,10 +1129,9 @@ async def mark_under_investigation(
 async def retry_recovery(
     incident_id: int,
     payload: RecoveryRequest,
-    x_demo_admin_token: str | None = Header(default=None),
+    principal: Principal = Depends(require_operator),
     session: AsyncSession = Depends(get_session),
 ) -> RecoveryExecutionResponse:
-    require_demo_admin(x_demo_admin_token)
     row = (await session.execute(select(Incident, Service).join(Service).where(Incident.id == incident_id))).first()
     if row is None:
         raise HTTPException(status_code=404, detail="Incident not found")
@@ -1085,7 +1140,7 @@ async def retry_recovery(
         incident.state = IncidentState.INVESTIGATING
         await session.commit()
     try:
-        execution, _ = await execute_recovery(session, monitoring, incident, service, payload.action_id, payload.parameters, "shared_operator")
+        execution, _ = await execute_recovery(session, monitoring, incident, service, payload.action_id, payload.parameters, principal.username)
     except PolicyRejected as exc:
         raise HTTPException(status_code=409, detail={"code": exc.code, "message": str(exc)}) from exc
     await session.refresh(execution)
@@ -1098,24 +1153,13 @@ async def list_notifications(session: AsyncSession = Depends(get_session)) -> li
     return [NotificationResponse.model_validate(record) for record in records]
 
 
-def require_demo_admin(x_demo_admin_token: str | None) -> None:
-    if settings.environment.lower() not in {"local", "demo", "test"} and settings.demo_admin_token == "local-demo-admin":
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Administrative authentication is not configured for this environment",
-        )
-    if x_demo_admin_token != settings.demo_admin_token:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Demo administrator authorization required")
-
-
 @api.get("/demo/scenarios", tags=["demo"])
 async def demo_scenarios() -> dict[str, object]:
     return {"simulated": True, "scenarios": sorted(DEMO_SCENARIOS)}
 
 
 @api.post("/demo/services/{service_id}/fault", tags=["demo"])
-async def inject_fault(service_id: int, payload: DemoFaultRequest, x_demo_admin_token: str | None = Header(default=None), session: AsyncSession = Depends(get_session)) -> dict[str, object]:
-    require_demo_admin(x_demo_admin_token)
+async def inject_fault(service_id: int, payload: DemoFaultRequest, principal: Principal = Depends(require_admin), session: AsyncSession = Depends(get_session)) -> dict[str, object]:
     if payload.scenario not in DEMO_SCENARIOS:
         raise HTTPException(status_code=422, detail="Unsupported demo scenario")
     service = await session.get(Service, service_id)
@@ -1127,6 +1171,7 @@ async def inject_fault(service_id: int, payload: DemoFaultRequest, x_demo_admin_
         session.add(fault)
     else:
         fault.scenario = payload.scenario
+    audit(session, principal, "demo.fault_injected", f"Fault {payload.scenario} injected into service {service_id}", is_demo=True)
     await session.commit()
     # Run the same health checks the monitor would, so the failure is detected now rather than after
     # `failure_threshold` monitoring intervals. Injecting "healthy" is a restore, which the monitor
@@ -1140,8 +1185,7 @@ async def inject_fault(service_id: int, payload: DemoFaultRequest, x_demo_admin_
 
 
 @api.post("/demo/services/{service_id}/reset", tags=["demo"])
-async def reset_demo(service_id: int, x_demo_admin_token: str | None = Header(default=None), session: AsyncSession = Depends(get_session)) -> dict[str, object]:
-    require_demo_admin(x_demo_admin_token)
+async def reset_demo(service_id: int, principal: Principal = Depends(require_admin), session: AsyncSession = Depends(get_session)) -> dict[str, object]:
     service = await session.get(Service, service_id)
     if service is None or not service.simulation_status or service.environment != "demo":
         raise HTTPException(status_code=403, detail="Reset is restricted to isolated demo services")
@@ -1150,8 +1194,10 @@ async def reset_demo(service_id: int, x_demo_admin_token: str | None = Header(de
         session.add(DemoFault(service_id=service_id, scenario="healthy"))
     else:
         fault.scenario = "healthy"
+    audit(session, principal, "demo.fault_reset", f"Service {service_id} fault reset to healthy", is_demo=True)
     await session.commit()
     return {"service_id": service_id, "scenario": "healthy", "simulated": True}
 
 
 app.include_router(api, prefix="/api/v1")
+app.include_router(auth_router, prefix="/api/v1")

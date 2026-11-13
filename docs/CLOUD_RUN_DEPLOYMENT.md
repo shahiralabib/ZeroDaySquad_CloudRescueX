@@ -29,4 +29,4 @@ The backend honors Cloud Run's `PORT` environment variable and exposes `/health`
 
 ## HTTPS and access
 
-Cloud Run provides HTTPS endpoints. Restrict `FRONTEND_ORIGINS` to the exact deployed frontend origin. Replace the prototype demo-admin token with real authentication/RBAC before exposing administrative operations publicly.
+Cloud Run provides HTTPS endpoints. Restrict `FRONTEND_ORIGINS` to the exact deployed frontend origin. Provide `AUTH_SECRET` and `AUTH_USERS_JSON` from Secret Manager (for example with `--set-secrets`) so users can sign in; without them every protected route answers 503. See the [hosted deployment checklist](ENVIRONMENT_VARIABLES.md#hosted-deployment-checklist). An external identity provider is still advisable before unrestricted public exposure.

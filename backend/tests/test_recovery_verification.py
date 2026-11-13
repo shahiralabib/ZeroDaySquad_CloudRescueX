@@ -10,8 +10,6 @@ from sqlalchemy import select
 from app.database import Incident, RecoveryApproval, Service, session_factory
 from app.main import _request_windows, app
 
-ADMIN = {"X-Demo-Admin-Token": "local-demo-admin"}
-
 
 @pytest.fixture(autouse=True)
 def clear_rate_limit_window():
@@ -24,10 +22,10 @@ def new_client() -> AsyncClient:
 
 async def run_scenario(client: AsyncClient, scenario: str) -> list[dict]:
     """Reset, start a run, and return the incidents it created."""
-    assert (await client.post("/api/v1/simulation/reset", headers=ADMIN)).status_code == 200
+    assert (await client.post("/api/v1/simulation/reset")).status_code == 200
     before = {item["id"] for item in (await client.get("/api/v1/incidents")).json()}
     started = await client.post(
-        "/api/v1/simulation/start", headers=ADMIN, json={"scenario": scenario, "seed": 42, "event_count": 10}
+        "/api/v1/simulation/start", json={"scenario": scenario, "seed": 42, "event_count": 10}
     )
     assert started.status_code == 200
     return [item for item in (await client.get("/api/v1/incidents")).json() if item["id"] not in before]
@@ -42,12 +40,12 @@ async def resource_statuses(client: AsyncClient) -> dict[str, str]:
 
 
 async def execute(client: AsyncClient, incident_id: int, action_id: str):
-    return await client.post(f"/api/v1/incidents/{incident_id}/recovery", headers=ADMIN, json={"action_id": action_id})
+    return await client.post(f"/api/v1/incidents/{incident_id}/recovery", json={"action_id": action_id})
 
 
 async def approve(client: AsyncClient, incident_id: int, action_id: str):
     return await client.post(
-        f"/api/v1/incidents/{incident_id}/recovery/approve", headers=ADMIN, json={"action_id": action_id}
+        f"/api/v1/incidents/{incident_id}/recovery/approve", json={"action_id": action_id}
     )
 
 
@@ -70,7 +68,7 @@ async def create_outage(client: AsyncClient, scenario: str) -> dict:
             json={"name": f"Verify {uuid4()}", "environment": "demo", "simulation_status": True, "failure_threshold": 1},
         )
     ).json()
-    await client.post(f"/api/v1/demo/services/{service['id']}/fault", headers=ADMIN, json={"scenario": scenario})
+    await client.post(f"/api/v1/demo/services/{service['id']}/fault", json={"scenario": scenario})
     incident = next(i for i in (await client.get("/api/v1/incidents")).json() if i["service_id"] == service["id"])
     return {"service": service, "incident": incident}
 
@@ -92,7 +90,6 @@ async def test_restarting_the_application_does_not_verify_an_authentication_atta
         # ...and an administrator-authorised retry of the wrong action runs but cannot be verified.
         response = await client.post(
             f"/api/v1/incidents/{incident['id']}/recovery/retry",
-            headers=ADMIN,
             json={"action_id": "restart_demo_application", "approved": True},
         )
         refreshed, verification = await outcome(client, incident["id"])
@@ -174,7 +171,7 @@ async def test_a_correct_action_heals_only_the_affected_resource():
 async def test_an_inapplicable_action_cannot_verify_even_if_the_resource_looks_healthy():
     async with new_client() as client:
         incident = by_rule(await run_scenario(client, "authentication_attack"), "repeated_failed_authentication")
-        assert (await client.post("/api/v1/simulation/reset", headers=ADMIN)).status_code == 200  # resources healthy again
+        assert (await client.post("/api/v1/simulation/reset")).status_code == 200  # resources healthy again
         assert (await resource_statuses(client))["sim-auth-01"] == "healthy"
 
         await execute(client, incident["id"], "restart_demo_application")
