@@ -103,10 +103,33 @@ async def affected_resource(session: AsyncSession, incident: Incident, *, refres
     return await session.scalar(query)
 
 
+# Rejections that are an expected outcome of the normal workflow (an approval has not been granted yet, the action does
+# not fit this incident, the incident is not in a state that allows recovery, the work is already done or in progress).
+# They are refused without escalating the incident to an administrator. Any other code, including unknown or future
+# ones, is a hard rejection that does escalate, so a new code is never silently treated as routine.
+SOFT_REJECTION_CODES = frozenset(
+    {
+        "APPROVAL_REQUIRED",
+        "ACTION_NOT_APPLICABLE",
+        "INVALID_INCIDENT_STATE",
+        "DUPLICATE_EXECUTION",
+        "INCIDENT_BUSY",
+    }
+)
+
+
 class PolicyRejected(ValueError):
-    def __init__(self, message: str, code: str = "POLICY_REJECTED"):
+    """A recovery request refused by policy.
+
+    ``escalates`` tells callers whether the rejection needs an administrator (hard) or is routine (soft). It defaults from
+    the code (see ``SOFT_REJECTION_CODES``) and can be set explicitly. Existing callers do not read it yet: recovery still
+    escalates every rejection until a later task acts on this distinction.
+    """
+
+    def __init__(self, message: str, code: str = "POLICY_REJECTED", escalates: bool | None = None):
         super().__init__(message)
         self.code = code
+        self.escalates = (code not in SOFT_REJECTION_CODES) if escalates is None else escalates
 
 
 def get_action(action_id: str) -> RecoveryAction:
