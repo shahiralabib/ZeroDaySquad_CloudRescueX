@@ -54,5 +54,7 @@ export const approveRecovery = (id: number, action_id: string, parameters: Recor
 export const executeRecovery = (id: number, action_id: string, approved = false, parameters: Record<string, unknown> = {}) => request<RecoveryExecution>(`/api/v1/incidents/${id}/recovery`, { method: "POST", headers: adminHeaders, body: JSON.stringify({ action_id, approved, parameters }) });
 export const retryRecovery = (id: number, action_id: string) => request<RecoveryExecution>(`/api/v1/incidents/${id}/recovery/retry`, { method: "POST", headers: adminHeaders, body: JSON.stringify({ action_id, approved: true }) });
 export const tickSimulation = () => request<{ status: string; scenario: string; tick_count: number }>("/api/v1/simulation/tick", { method: "POST", headers: adminHeaders });
-export const acknowledgeEscalation = (id: number) => request<Escalation>(`/api/v1/incidents/${id}/acknowledge?administrator=local-admin`, { method: "POST", headers: adminHeaders });
-export const rejectRecovery = (id: number, reason: string) => request<Escalation>(`/api/v1/incidents/${id}/reject-recovery?reason=${encodeURIComponent(reason)}`, { method: "POST", headers: adminHeaders });
+// The escalation id targets one specific escalation; without it the API uses the incident's newest pending one.
+const escalationQuery = (escalationId?: number) => (escalationId === undefined ? "" : `&escalation_id=${escalationId}`);
+export const acknowledgeEscalation = (id: number, escalationId?: number) => request<Escalation>(`/api/v1/incidents/${id}/acknowledge?administrator=local-admin${escalationQuery(escalationId)}`, { method: "POST", headers: adminHeaders });
+export const rejectRecovery = (id: number, reason: string, escalationId?: number) => request<Escalation>(`/api/v1/incidents/${id}/reject-recovery?reason=${encodeURIComponent(reason)}&administrator=local-admin${escalationQuery(escalationId)}`, { method: "POST", headers: adminHeaders });

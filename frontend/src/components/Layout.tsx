@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { NavLink, useLocation, useNavigate } from "react-router-dom";
-import { Activity, Bell, Boxes, ChevronDown, ChevronsLeft, ChevronsRight, CircleHelp, FlaskConical, History, LayoutDashboard, Menu, Search, Settings, ShieldAlert, ShieldCheck, Siren, X } from "lucide-react";
+import { Activity, Bell, Boxes, ChevronsLeft, ChevronsRight, CircleHelp, FlaskConical, History, LayoutDashboard, Menu, Search, Settings, ShieldAlert, ShieldCheck, Siren, X } from "lucide-react";
 import { fetchHealth, fetchNotifications } from "../lib/api";
 
 const navigation = [
@@ -17,19 +17,37 @@ const administration = [
   { label: "Settings", path: "/settings", icon: Settings },
 ];
 
+// The sidebar identity card describes the environment the API reports on GET /health. CloudRescueX has a single
+// environment (there are no selectable workspaces), so the card is informational and not interactive.
+type EnvironmentState = { state: "loading" } | { state: "unavailable" } | { state: "ready"; mode: string };
+
+export function environmentLabel(environment: EnvironmentState): string {
+  if (environment.state === "loading") return "Checking environment…";
+  if (environment.state === "unavailable") return "Environment unknown";
+  const mode = environment.mode.trim();
+  // "DEMO" -> "Demo environment", "LIVE" -> "Live environment"; a missing mode gets a neutral label.
+  return mode ? `${mode.charAt(0).toUpperCase()}${mode.slice(1).toLowerCase()} environment` : "Environment";
+}
+
 export function Layout({ children }: { children: ReactNode }) {
   const [open, setOpen] = useState(false);
   const [collapsed, setCollapsed] = useState(false);
   const [notificationsOpen, setNotificationsOpen] = useState(false);
   const [unreadNotifications, setUnreadNotifications] = useState(0);
   const [apiStatus, setApiStatus] = useState<"checking" | "connected" | "unavailable">("checking");
+  const [environment, setEnvironment] = useState<EnvironmentState>({ state: "loading" });
   const location = useLocation();
   const navigate = useNavigate();
   const currentLabel = useMemo(() => [...navigation, ...administration].find((item) => item.path === location.pathname || (item.path !== "/" && location.pathname.startsWith(`${item.path}/`)))?.label ?? "Overview", [location.pathname]);
 
   useEffect(() => {
     let active = true;
-    Promise.all([fetchHealth(), fetchNotifications()])
+    const health = fetchHealth();
+    // The identity card only needs /health, so it must not depend on the notifications request succeeding.
+    health
+      .then((response) => { if (active) setEnvironment({ state: "ready", mode: response.mode ?? "" }); })
+      .catch(() => { if (active) setEnvironment({ state: "unavailable" }); });
+    Promise.all([health, fetchNotifications()])
       .then(([, notifications]) => {
         if (active) setApiStatus("connected");
         if (active) setUnreadNotifications(notifications.filter((notification) => !notification.read).length);
@@ -55,8 +73,7 @@ export function Layout({ children }: { children: ReactNode }) {
         </div>
         <div className="soc-workspace">
           <div className="soc-workspace-avatar"><Activity size={15} /></div>
-          <div className="soc-workspace-copy"><span>CloudRescueX</span><small>Operations workspace</small></div>
-          <ChevronDown size={15} className="text-slate-500" />
+          <div className="soc-workspace-copy"><span>CloudRescueX</span><small>{environmentLabel(environment)}</small></div>
         </div>
         <div className="soc-nav-caption">WORKSPACE</div>
         <nav className="soc-nav">

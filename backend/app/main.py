@@ -46,6 +46,15 @@ from app.logging import configure_logging
 from app.monitoring import MonitoringEngine
 from app.cloud_adapters import integration_statuses
 from app.recovery import ACTION_CATALOG, PolicyRejected, affected_resource, execute_recovery, create_escalation, get_action, parameters_hash, validate_policy
+from app.escalations import (
+    STATUS_ACKNOWLEDGED,
+    STATUS_REJECTED,
+    EscalationConflict,
+    EscalationNotFound,
+    escalation_status,
+    process_escalation,
+    rejection_of,
+)
 from app.remediation import ESCALATE_TO_ADMINISTRATOR
 from app.simulation import (
     SCENARIOS,
@@ -154,6 +163,8 @@ def escalation_response(record: Escalation) -> EscalationResponse:
         recommended_next_steps=record.recommended_next_steps, acknowledged=record.acknowledged,
         assigned_administrator=record.assigned_administrator, escalated_at=record.escalated_at,
         acknowledged_at=record.acknowledged_at,
+        status=escalation_status(record),
+        rejection_reason=(rejection_of(record) or {}).get("reason"),
     )
 
 
@@ -942,8 +953,14 @@ async def list_verifications(incident_id: int, session: AsyncSession = Depends(g
 
 
 @api.get("/escalations", response_model=list[EscalationResponse], tags=["escalation"])
-async def list_escalations(session: AsyncSession = Depends(get_session)) -> list[EscalationResponse]:
-    records = list((await session.scalars(select(Escalation).order_by(Escalation.escalated_at.desc()))).all())
+async def list_escalations(
+    status_filter: str | None = Query(default=None, alias="status", pattern="^(pending|acknowledged|rejected)$"),
+    session: AsyncSession = Depends(get_session),
+) -> list[EscalationResponse]:
+    """All escalations, newest first. Processed escalations stay listed as history; filter with ?status=pending."""
+    records = list((await session.scalars(select(Escalation).order_by(Escalation.escalated_at.desc(), Escalation.id.desc()))).all())
+    if status_filter is not None:
+        records = [record for record in records if escalation_status(record) == status_filter]
     return [escalation_response(record) for record in records]
 
 
@@ -951,26 +968,31 @@ async def list_escalations(session: AsyncSession = Depends(get_session)) -> list
 async def incident_escalations(incident_id: int, session: AsyncSession = Depends(get_session)) -> list[EscalationResponse]:
     if await session.get(Incident, incident_id) is None:
         raise HTTPException(status_code=404, detail="Incident not found")
-    records = list((await session.scalars(select(Escalation).where(Escalation.incident_id == incident_id).order_by(Escalation.escalated_at.desc()))).all())
+    records = list((await session.scalars(select(Escalation).where(Escalation.incident_id == incident_id).order_by(Escalation.escalated_at.desc(), Escalation.id.desc()))).all())
     return [escalation_response(record) for record in records]
+
+
+def _escalation_error(exc: Exception) -> HTTPException:
+    if isinstance(exc, EscalationNotFound):
+        return HTTPException(status_code=404, detail=str(exc))
+    return HTTPException(status_code=409, detail={"code": getattr(exc, "code", "ESCALATION_CONFLICT"), "message": str(exc)})
 
 
 @api.post("/incidents/{incident_id}/acknowledge", response_model=EscalationResponse, tags=["escalation"])
 async def acknowledge_incident(
     incident_id: int,
-    administrator: str = "local-admin",
+    administrator: str = Query(default="local-admin", min_length=1, max_length=120),
+    escalation_id: int | None = Query(default=None, ge=1),
     x_demo_admin_token: str | None = Header(default=None),
     session: AsyncSession = Depends(get_session),
 ) -> EscalationResponse:
+    """Acknowledge one escalation (``escalation_id``, or the incident's newest pending one). Idempotency: a second call is a 409."""
     require_demo_admin(x_demo_admin_token)
-    escalation = await session.scalar(select(Escalation).where(Escalation.incident_id == incident_id).order_by(Escalation.escalated_at.desc()))
-    if escalation is None:
-        raise HTTPException(status_code=404, detail="Escalation not found")
-    escalation.acknowledged = True
-    escalation.assigned_administrator = administrator
-    escalation.acknowledged_at = datetime.now(timezone.utc)
-    session.add(AuditEvent(event_type="escalation.acknowledged", message=f"Escalation {escalation.id} acknowledged by {administrator}", is_demo=True))
-    session.add(IncidentEvent(incident_id=incident_id, event_type="ADMIN_ACKNOWLEDGED", description=f"Administrator {administrator} acknowledged escalation.", metadata_json=json.dumps({"administrator": administrator})))
+    try:
+        escalation = await process_escalation(session, incident_id, escalation_id, STATUS_ACKNOWLEDGED, administrator)
+    except (EscalationNotFound, EscalationConflict) as exc:
+        await session.rollback()
+        raise _escalation_error(exc) from exc
     await session.commit()
     return escalation_response(escalation)
 
@@ -978,25 +1000,43 @@ async def acknowledge_incident(
 @api.post("/incidents/{incident_id}/reject-recovery", response_model=EscalationResponse, tags=["escalation"])
 async def reject_recovery(
     incident_id: int,
-    reason: str = "Administrator rejected the proposed recovery action.",
+    reason: str = Query(default="Administrator rejected the proposed recovery action.", min_length=1, max_length=500),
+    administrator: str = Query(default="local-admin", min_length=1, max_length=120),
+    escalation_id: int | None = Query(default=None, ge=1),
     x_demo_admin_token: str | None = Header(default=None),
     session: AsyncSession = Depends(get_session),
 ) -> EscalationResponse:
+    """Reject the proposed recovery of one escalation and record the decision.
+
+    The escalation and the decision stay in history, unused approvals for the incident are revoked, and the incident is
+    NOT resolved: it stays open for manual handling. An incident that was never escalated is escalated first.
+    """
     require_demo_admin(x_demo_admin_token)
     incident = await session.get(Incident, incident_id)
     if incident is None:
         raise HTTPException(status_code=404, detail="Incident not found")
-    escalation = await create_escalation(
-        session,
-        incident,
-        reason,
-        {"source": "administrator", "decision": "rejected"},
-        "Investigate manually and select a separately approved safe action.",
-    )
-    session.add(AuditEvent(event_type="recovery.rejected", message=f"Recovery rejected for incident {incident_id}: {reason}", is_demo=incident.is_demo))
+    try:
+        try:
+            escalation = await process_escalation(session, incident_id, escalation_id, STATUS_REJECTED, administrator, reason)
+        except EscalationNotFound:
+            if escalation_id is not None:
+                raise
+            if incident.state == IncidentState.RESOLVED:
+                raise EscalationConflict("The incident is already resolved, so there is no recovery to reject.", "INCIDENT_RESOLVED")
+            created = await create_escalation(
+                session,
+                incident,
+                reason,
+                {"source": "administrator", "decision": "rejected"},
+                "Investigate manually and select a separately approved safe action.",
+            )
+            await session.flush()
+            escalation = await process_escalation(session, incident_id, created.id, STATUS_REJECTED, administrator, reason)
+    except (EscalationNotFound, EscalationConflict) as exc:
+        await session.rollback()
+        raise _escalation_error(exc) from exc
     await session.commit()
     return escalation_response(escalation)
-
 
 @api.post("/incidents/{incident_id}/under-investigation", response_model=IncidentResponse, tags=["escalation"])
 async def mark_under_investigation(

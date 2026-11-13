@@ -231,6 +231,9 @@ class EscalationResponse(BaseModel):
     assigned_administrator: str | None
     escalated_at: datetime | None
     acknowledged_at: datetime | None
+    # Derived from persisted columns: pending, acknowledged, or rejected (a rejected recovery also keeps its reason).
+    status: str = "pending"
+    rejection_reason: str | None = None
 
 
 class NotificationResponse(BaseModel):
